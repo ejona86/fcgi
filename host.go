@@ -2,63 +2,40 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// This file implements the host side of CGI (being the webserver
-// parent process).
+// This file implements the host side of FastCGI (being the webserver
+// that connects as a client).
 
-// Package cgi implements CGI (Common Gateway Interface) as specified
-// in RFC 3875.
-//
-// Note that using CGI means starting a new process to handle each
-// request, which is typically less efficient than using a
-// long-running server. This package is intended primarily for
-// compatibility with existing systems.
-package cgi
+package fcgi
 
 import (
 	"bufio"
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"regexp"
-	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 var trailingPort = regexp.MustCompile(`:([0-9]+)$`)
 
-var osDefaultInheritEnv = map[string][]string{
-	"darwin":  {"DYLD_LIBRARY_PATH"},
-	"freebsd": {"LD_LIBRARY_PATH"},
-	"hpux":    {"LD_LIBRARY_PATH", "SHLIB_PATH"},
-	"irix":    {"LD_LIBRARY_PATH", "LD_LIBRARYN32_PATH", "LD_LIBRARY64_PATH"},
-	"linux":   {"LD_LIBRARY_PATH"},
-	"openbsd": {"LD_LIBRARY_PATH"},
-	"solaris": {"LD_LIBRARY_PATH", "LD_LIBRARY_PATH_32", "LD_LIBRARY_PATH_64"},
-	"windows": {"SystemRoot", "COMSPEC", "PATHEXT", "WINDIR"},
-}
-
 // Handler runs an executable in a subprocess with a CGI environment.
 type Handler struct {
+	Dialer Dialer // dialer for each request
+
 	Path string // path to the CGI executable
 	Root string // root URI prefix of handler or empty for "/"
 
-	// Dir specifies the CGI executable's working directory.
-	// If Dir is empty, the base directory of Path is used.
-	// If Path has no base directory, the current working
-	// directory is used.
-	Dir string
-
-	Env        []string    // extra environment variables to set, if any, as "key=value"
-	InheritEnv []string    // environment variables to inherit from host, as "key"
-	Logger     *log.Logger // optional log for errors or nil to use log.Print
-	Args       []string    // optional arguments to pass to child process
-	Stderr     io.Writer   // optional stderr for the child process; nil means os.Stderr
+	Env    []string    // extra environment variables to set, if any, as "key=value"
+	Logger *log.Logger // optional log for errors or nil to use log.Print
+	Stderr io.Writer   // optional stderr for the child process; nil means os.Stderr
 
 	// PathLocationHandler specifies the root http Handler that
 	// should handle internal redirects when the CGI process
@@ -76,31 +53,6 @@ func (h *Handler) stderr() io.Writer {
 		return h.Stderr
 	}
 	return os.Stderr
-}
-
-// removeLeadingDuplicates remove leading duplicate in environments.
-// It's possible to override environment like following.
-//    cgi.Handler{
-//      ...
-//      Env: []string{"SCRIPT_FILENAME=foo.php"},
-//    }
-func removeLeadingDuplicates(env []string) (ret []string) {
-	for i, e := range env {
-		found := false
-		if eq := strings.IndexByte(e, '='); eq != -1 {
-			keq := e[:eq+1] // "key="
-			for _, e2 := range env[i+1:] {
-				if strings.HasPrefix(e2, keq) {
-					found = true
-					break
-				}
-			}
-		}
-		if !found {
-			ret = append(ret, e)
-		}
-	}
-	return
 }
 
 func (h *Handler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
@@ -171,39 +123,8 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		env = append(env, "CONTENT_TYPE="+ctype)
 	}
 
-	envPath := os.Getenv("PATH")
-	if envPath == "" {
-		envPath = "/bin:/usr/bin:/usr/ucb:/usr/bsd:/usr/local/bin"
-	}
-	env = append(env, "PATH="+envPath)
-
-	for _, e := range h.InheritEnv {
-		if v := os.Getenv(e); v != "" {
-			env = append(env, e+"="+v)
-		}
-	}
-
-	for _, e := range osDefaultInheritEnv[runtime.GOOS] {
-		if v := os.Getenv(e); v != "" {
-			env = append(env, e+"="+v)
-		}
-	}
-
 	if h.Env != nil {
 		env = append(env, h.Env...)
-	}
-
-	env = removeLeadingDuplicates(env)
-
-	var cwd, path string
-	if h.Dir != "" {
-		path = h.Path
-		cwd = h.Dir
-	} else {
-		cwd, path = filepath.Split(h.Path)
-	}
-	if cwd == "" {
-		cwd = "."
 	}
 
 	internalError := func(err error) {
@@ -211,31 +132,29 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		h.printf("CGI error: %v", err)
 	}
 
-	cmd := &exec.Cmd{
-		Path:   path,
-		Args:   append([]string{h.Path}, h.Args...),
-		Dir:    cwd,
-		Env:    env,
-		Stderr: h.stderr(),
+	client, err := h.Dialer.Dial(req.Context())
+	if err != nil {
+		internalError(err)
+		return
 	}
+	defer h.Dialer.Close(client)
+
+	hostReq := &hostRequest{
+		host:   &client.host,
+		stderr: h.stderr(),
+		reqId:  client.host.reserveReqId(),
+	}
+	stdoutRead := hostReq.stdoutPipe()
+	var body io.ReadCloser
 	if req.ContentLength != 0 {
-		cmd.Stdin = req.Body
+		body = req.Body
 	}
-	stdoutRead, err := cmd.StdoutPipe()
+	err = hostReq.handle(envSliceToMap(env), body)
 	if err != nil {
 		internalError(err)
 		return
 	}
 
-	err = cmd.Start()
-	if err != nil {
-		internalError(err)
-		return
-	}
-	if hook := testHookStartProcess; hook != nil {
-		hook(cmd.Process)
-	}
-	defer cmd.Wait()
 	defer stdoutRead.Close()
 
 	linebody := bufio.NewReaderSize(stdoutRead, 1024)
@@ -328,13 +247,6 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	_, err = io.Copy(rw, linebody)
 	if err != nil {
 		h.printf("cgi: copy error: %v", err)
-		// And kill the child CGI process so we don't hang on
-		// the deferred cmd.Wait above if the error was just
-		// the client (rw) going away. If it was a read error
-		// (because the child died itself), then the extra
-		// kill of an already-dead process is harmless (the PID
-		// won't be reused until the Wait above).
-		cmd.Process.Kill()
 	}
 }
 
@@ -392,4 +304,457 @@ func upperCaseAndUnderscore(r rune) rune {
 	return r
 }
 
-var testHookStartProcess func(*os.Process) // nil except for some tests
+// envSliceToMap converts env slice to map. In case of duplicates, last instance wins.
+func envSliceToMap(env []string) map[string]string {
+	m := make(map[string]string)
+	for _, e := range env {
+		if eq := strings.IndexByte(e, '='); eq != -1 {
+			key := e[:eq]
+			value := e[eq+1:]
+			m[key] = value
+		}
+	}
+	return m
+}
+
+// Dialer provides a Client when needed, allowing for reuse.
+type Dialer interface {
+	// Dial returns a Client for use, or error if unable
+	Dial(ctx context.Context) (*Client, error)
+	// Close returns the Client, where it may be closed
+	Close(client *Client)
+}
+
+// BasicDialer simply creates a new Client each time
+type BasicDialer struct {
+	Network string
+	Address string
+}
+
+func (d *BasicDialer) Dial(ctx context.Context) (*Client, error) {
+	netDialer := net.Dialer{}
+	netConn, err := netDialer.DialContext(ctx, d.Network, d.Address)
+	if err != nil {
+		return nil, err
+	}
+	return NewClient(netConn)
+}
+
+func (d *BasicDialer) Close(client *Client) {
+	client.Close()
+}
+
+// Client is a connection to a FastCGI server, as used by a web server. It can
+// support multiple concurrent requests, although using separate connections is
+// encouraged as a slowly-drained response may slow all responses from the
+// Client.
+type Client struct {
+	host host
+}
+
+// Close aborts any in-progress requests and frees the Client's resources
+func (c *Client) Close() error {
+	return c.host.shutdown()
+}
+
+// Returns non-nil when the Client is in a failing state and should no longer
+// be used. Even with an error, Close is expected to be called eventually.
+func (c *Client) Err() error {
+	return c.host.err()
+}
+
+// NewClient creates a new client using netConn for communication. netConn must
+// support multiple goroutines invoking its methods simultaneously.
+func NewClient(netConn io.ReadWriteCloser) (*Client, error) {
+	c := &Client{
+		host{
+			conn:          newConn(netConn),
+			handshakeChan: make(chan struct{}),
+			maxReqs:       math.MaxUint16,
+		},
+	}
+	h := c.host
+	h.reqIdCond.L = &h.mutex
+	go h.readLoop()
+
+	values := map[string]string{
+		"FCGI_MAX_REQS ":  "",
+		"FCGI_MPXS_CONNS": "",
+	}
+	if err := h.conn.writePairs(typeGetValues, 0, values); err != nil {
+		h.conn.Close()
+		return nil, err
+	}
+	<-h.handshakeChan
+
+	return c, nil
+}
+
+// host manages web server state for a fcgi connection. Senders write directly
+// to the conn. It has a dedicated read goroutine, but it blocks waiting for
+// readers to consume since fcgi lacks per-request flow control.
+type host struct {
+	conn *conn
+	// handshakeChan is closed when handshake is complete.
+	handshakeChan chan struct{}
+
+	// mutex should be held when accessing the following fields.
+	mutex sync.Mutex
+	// handshaked is true when handshake is complete, to avoid closing
+	// handshakeChan multiple times.
+	handshaked bool
+	// reqIdCond for coordinating when new reqIds may be available, or closed.
+	reqIdCond sync.Cond
+	// maxReqs is the maximum number of requests the fcgi application
+	// supports. reqIdCond should be signaled when increased.
+	maxReqs uint16
+	// lastReqId is the last request id that has been used.
+	lastReqId uint16
+	// freeReqIds are request ids available for reuse. reqIdCond should be
+	// signaled when added to.
+	freeReqIds []uint16
+	// reqs contains all requests still using their request id.
+	reqs map[uint16]*hostRequest
+	// closed is non-nil when communication is broken, to report via Err().
+	// reqIdCond should be signaled when assigning.
+	closed error
+}
+
+func (h *host) shutdown() error {
+	h.mutex.Lock()
+	defer h.mutex.Unlock()
+	if h.closed != nil {
+		return nil
+	}
+	h.closed = errors.New("fcgi: client closed")
+	h.reqIdCond.Broadcast()
+	for _, hr := range h.reqs {
+		hr.tryClose(h.closed)
+	}
+	// This will cause reader goroutine to stop
+	return h.conn.Close()
+}
+
+func (h *host) err() error {
+	h.mutex.Lock()
+	defer h.mutex.Unlock()
+	return h.closed
+}
+
+func (h *host) readLoop() {
+	// record is really large; it's important to only have one
+	var rec record
+	var err error
+	for {
+		if err = rec.read(h.conn.rwc); err != nil {
+			break
+		}
+		if err = h.handleRecord(&rec); err != nil {
+			break
+		}
+	}
+
+	h.mutex.Lock()
+	if !h.handshaked {
+		h.handshaked = true
+		close(h.handshakeChan)
+	}
+	if h.closed == nil {
+		h.closed = err
+		h.reqIdCond.Broadcast()
+	}
+	reqs := h.reqs
+	h.reqs = nil
+	h.mutex.Unlock()
+
+	for _, hr := range reqs {
+		hr.tryClose(err)
+	}
+}
+
+// handleRecord returns an error for unrecoverable failures.
+func (h *host) handleRecord(rec *record) error {
+	if rec.h.Id == 0 {
+		// management record
+		switch rec.h.Type {
+		case typeGetValuesResult:
+			h.mutex.Lock()
+			if !h.handshaked {
+				h.handshaked = true
+				close(h.handshakeChan)
+			}
+			values := readPairs(rec.content())
+			if v, ok := intFromMap(values, "FCGI_MAX_REQS"); ok && uint16(v) > 1 {
+				h.maxReqs = uint16(v)
+				h.reqIdCond.Broadcast()
+			}
+			if v, ok := intFromMap(values, "FCGI_MPXS_CONNS"); ok {
+				if v == 0 {
+					h.maxReqs = 1
+				}
+			}
+			h.mutex.Unlock()
+		default:
+			// TODO: log for typeUnknownType?
+		}
+		return nil
+	}
+	h.mutex.Lock()
+	hr, ok := h.reqs[rec.h.Id]
+	h.mutex.Unlock()
+	if !ok {
+		// Applications must ignore unknown requestIds, but web servers don't
+		return errors.New("fcgi: received frame for unexpected requestId")
+	}
+
+	return hr.handleRecord(rec)
+}
+
+func intFromMap(m map[string]string, k string) (i int, ok bool) {
+	s, ok := m[k]
+	if !ok {
+		return 0, false
+	}
+	i, err := strconv.Atoi(s)
+	if err != nil {
+		return 0, false
+	}
+	return i, true
+}
+
+// reserveReqId allocates a request id, blocking as necessary. If the
+// connection is failing, 0 is returned.
+func (h *host) reserveReqId() uint16 {
+	var reqId uint16
+	h.mutex.Lock()
+	defer h.mutex.Unlock()
+	for {
+		if h.closed != nil {
+			return 0
+		}
+		if len(h.freeReqIds) != 0 {
+			reqId = h.freeReqIds[len(h.freeReqIds)-1]
+			h.freeReqIds = h.freeReqIds[:len(h.freeReqIds)-1]
+			break
+		}
+		if h.lastReqId < h.maxReqs {
+			h.lastReqId += 1
+			reqId = h.lastReqId
+			break
+		}
+		h.reqIdCond.Wait()
+	}
+	return reqId
+}
+
+// returnReqId returns reqId to a pool for reuse. It must be completely unused,
+// including sending, receiving, and error handling.
+func (h *host) returnReqId(reqId uint16) {
+	h.mutex.Lock()
+	if _, ok := h.reqs[reqId]; !ok {
+		panic("request id not registered")
+	}
+	delete(h.reqs, reqId)
+	h.freeReqIds = append(h.freeReqIds, reqId)
+	h.reqIdCond.Signal()
+	h.mutex.Unlock()
+}
+
+// hostRequest is a fcgi request as managed by the web server.
+type hostRequest struct {
+	// must be set before handle()
+	host   *host
+	stdout *io.PipeWriter
+	stderr io.Writer
+	reqId  uint16
+
+	stdoutClose sync.Once // first close should win
+
+	// state for reader
+	stdoutEOS bool // stdoutEOS is true after receiving empty frame for stdout
+
+	// mutex should be held when accessing the following fields
+	mutex           sync.Mutex
+	inEnded         bool // inEnded is true after receiving typeEndRequest
+	outEnded        bool // outEnded is true after closing stdout or sending abortRequest
+	abortInProgress bool
+}
+
+func (hr *hostRequest) tryClose(err error) {
+	hr.stdoutClose.Do(func() {
+		hr.stdout.CloseWithError(err)
+	})
+}
+
+// stdoutPipe initializes stdout with a pipe and returns the pipe's ReadCloser.
+// The pipe is request-aware, so it can abort the request when appropriate.
+func (hr *hostRequest) stdoutPipe() io.ReadCloser {
+	var rc io.ReadCloser
+	rc, hr.stdout = io.Pipe()
+	return &abortReader{rc, hr}
+}
+
+// handle issues an http request with cgi-style env headers and req body,
+// returning HTTP-encoded response. req will be consumed in a separate goroutine.
+func (hr *hostRequest) handle(env map[string]string, req io.ReadCloser) error {
+	if hr.reqId == 0 {
+		// reserveReqId may have detected a failure
+		if err := hr.host.err(); err != nil {
+			return err
+		}
+		panic("reqId must be non-zero")
+	}
+	if hr.stdout == nil {
+		panic("stdoutPipe must be called before handle")
+	}
+	if err := hr.host.conn.writeBeginRequest(hr.reqId, roleResponder, flagKeepConn); err != nil {
+		return err
+	}
+
+	if err := hr.host.conn.writePairs(typeParams, hr.reqId, env); err != nil {
+		return err
+	}
+
+	outEnded := func() {
+		hr.mutex.Lock()
+		hr.outEnded = true
+		allDone := hr.allDoneLocked()
+		hr.mutex.Unlock()
+		if allDone {
+			hr.host.returnReqId(hr.reqId)
+		}
+
+	}
+	if req == nil {
+		body := newWriter(hr.host.conn, typeStdin, hr.reqId)
+		if err := body.Close(); err != nil {
+			return err
+		}
+		outEnded()
+	} else {
+		go func() {
+			body := newWriter(hr.host.conn, typeStdin, hr.reqId)
+			_, err := io.Copy(body, req)
+			if err1 := req.Close(); err == nil {
+				err = err1
+			}
+			if err == nil {
+				err = body.Close()
+			} else {
+				hr.tryClose(err)
+				hr.host.conn.writeAbortRequest(hr.reqId)
+			}
+			outEnded()
+		}()
+	}
+
+	return nil
+}
+
+// handleRecord returns an error for unrecoverable failures that impact the
+// entire connection.
+func (hr *hostRequest) handleRecord(rec *record) error {
+	switch rec.h.Type {
+	case typeStdout:
+		content := rec.content()
+		if len(content) == 0 {
+			// End of stream
+			hr.stdoutEOS = true
+		} else {
+			// This may take a long time
+			if _, err := hr.stdout.Write(content); err != nil {
+				// sending from read loop could cause deadlock.
+				// If this turns out to be frequent, it could
+				// be replaced with a dedicated goroutine that
+				// receives abort requests from an unbounded
+				// queue.
+				go hr.abortReader()
+			}
+		}
+		return nil
+	case typeStderr:
+		content := rec.content()
+		if len(content) == 0 {
+			// End of stream. Nothing really to do
+		} else {
+			// TODO: how to report error?
+			hr.stderr.Write(content)
+		}
+		return nil
+	case typeEndRequest:
+		hr.mutex.Lock()
+		hr.inEnded = true
+		allDone := hr.allDoneLocked()
+		hr.mutex.Unlock()
+		if allDone {
+			hr.host.returnReqId(hr.reqId)
+		}
+
+		var er endRequest
+		if err := er.read(rec.content()); err != nil {
+			return err
+		}
+		if er.protocolStatus != statusRequestComplete {
+			// TODO: translate int to name
+			hr.tryClose(
+				fmt.Errorf("fcgi: protocol status: %d", er.protocolStatus))
+			return nil
+		}
+		if er.appStatus != 0 {
+			hr.tryClose(
+				fmt.Errorf("fcgi: application exit code: %d", er.appStatus))
+			return nil
+		}
+		if !hr.stdoutEOS {
+			hr.tryClose(
+				errors.New("fcgi: request completed before stdout ended"))
+			return nil
+		}
+		hr.stdoutClose.Do(func() {
+			hr.stdout.Close()
+		})
+		return nil
+	default:
+		// Applications have a graceful way to report unknown frame types, but web servers don't
+		return fmt.Errorf("fcgi: received unknown frame type: %d", rec.h.Type)
+	}
+}
+
+// allDoneLocked returns true if this request will no longer use its reqId.
+// mutex must be held when calling this function.
+func (hr *hostRequest) allDoneLocked() bool {
+	// when changing this, audit needToAbort in abortReader.Close()
+	return hr.inEnded && hr.outEnded && !hr.abortInProgress
+}
+
+func (hr *hostRequest) abortReader() error {
+	hr.mutex.Lock()
+	needToAbort := !hr.inEnded && hr.outEnded && !hr.abortInProgress
+	hr.abortInProgress = needToAbort
+	hr.mutex.Unlock()
+
+	if !needToAbort {
+		return nil
+	}
+	// outEnded is already true
+	err := hr.host.conn.writeAbortRequest(hr.reqId)
+
+	hr.mutex.Lock()
+	hr.abortInProgress = false
+	allDone := hr.allDoneLocked()
+	hr.mutex.Unlock()
+	if allDone {
+		hr.host.returnReqId(hr.reqId)
+	}
+	return err
+}
+
+type abortReader struct {
+	io.ReadCloser
+	hr *hostRequest
+}
+
+func (r *abortReader) Close() error {
+	r.ReadCloser.Close()
+	return r.hr.abortReader()
+}

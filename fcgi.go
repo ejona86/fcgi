@@ -24,7 +24,7 @@ import (
 )
 
 // recType is a record type, as defined by
-// http://www.fastcgi.com/devkit/doc/fcgi-spec.html#S8
+// https://web.archive.org/web/20150420080736/http://www.fastcgi.com/drupal/node/6?q=node/22#S8
 type recType uint8
 
 const (
@@ -83,6 +83,21 @@ func (br *beginRequest) read(content []byte) error {
 	}
 	br.role = binary.BigEndian.Uint16(content)
 	br.flags = content[2]
+	return nil
+}
+
+type endRequest struct {
+	appStatus      int32
+	protocolStatus uint8
+	reserved       [3]uint8
+}
+
+func (er *endRequest) read(content []byte) error {
+	if len(content) != 8 {
+		return errors.New("fcgi: invalid end request record")
+	}
+	er.appStatus = int32(binary.BigEndian.Uint32(content))
+	er.protocolStatus = content[4]
 	return nil
 }
 
@@ -160,6 +175,17 @@ func (c *conn) writeRecord(recType recType, reqId uint16, b []byte) error {
 	return err
 }
 
+func (c *conn) writeBeginRequest(reqId uint16, role uint16, flags uint8) error {
+	b := make([]byte, 8)
+	binary.BigEndian.PutUint16(b, role)
+	b[2] = flags
+	return c.writeRecord(typeBeginRequest, reqId, b)
+}
+
+func (c *conn) writeAbortRequest(reqId uint16) error {
+	return c.writeRecord(typeAbortRequest, reqId, nil)
+}
+
 func (c *conn) writeEndRequest(reqId uint16, appStatus int, protocolStatus uint8) error {
 	b := make([]byte, 8)
 	binary.BigEndian.PutUint32(b, uint32(appStatus))
@@ -208,6 +234,31 @@ func readString(s []byte, size uint32) string {
 		return ""
 	}
 	return string(s[:size])
+}
+
+func readPairs(text []byte) (pairs map[string]string) {
+	pairs = make(map[string]string)
+	for len(text) > 0 {
+		keyLen, n := readSize(text)
+		if n == 0 {
+			return
+		}
+		text = text[n:]
+		valLen, n := readSize(text)
+		if n == 0 {
+			return
+		}
+		text = text[n:]
+		if int(keyLen)+int(valLen) > len(text) {
+			return
+		}
+		key := readString(text, keyLen)
+		text = text[keyLen:]
+		val := readString(text, valLen)
+		text = text[valLen:]
+		pairs[key] = val
+	}
+	return
 }
 
 func encodeSize(b []byte, size uint32) int {
