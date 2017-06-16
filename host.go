@@ -142,8 +142,8 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	hostReq := &hostRequest{
 		host:   &client.host,
 		stderr: h.stderr(),
-		reqId:  client.host.reserveReqId(),
 	}
+	client.host.reserveReqId(hostReq)
 	stdoutRead := hostReq.stdoutPipe()
 	var body io.ReadCloser
 	if req.ContentLength != 0 {
@@ -371,6 +371,7 @@ func NewClient(netConn io.ReadWriteCloser) (*Client, error) {
 			conn:          newConn(netConn),
 			handshakeChan: make(chan struct{}),
 			maxReqs:       math.MaxUint16,
+			reqs:          make(map[uint16]*hostRequest),
 		},
 	}
 	h := c.host
@@ -523,14 +524,15 @@ func intFromMap(m map[string]string, k string) (i int, ok bool) {
 }
 
 // reserveReqId allocates a request id, blocking as necessary. If the
-// connection is failing, 0 is returned.
-func (h *host) reserveReqId() uint16 {
+// connection is failing, 0 is used.
+func (h *host) reserveReqId(hr *hostRequest) {
 	var reqId uint16
 	h.mutex.Lock()
 	defer h.mutex.Unlock()
 	for {
 		if h.closed != nil {
-			return 0
+			hr.reqId = 0
+			return
 		}
 		if len(h.freeReqIds) != 0 {
 			reqId = h.freeReqIds[len(h.freeReqIds)-1]
@@ -544,7 +546,8 @@ func (h *host) reserveReqId() uint16 {
 		}
 		h.reqIdCond.Wait()
 	}
-	return reqId
+	hr.reqId = reqId
+	h.reqs[reqId] = hr
 }
 
 // returnReqId returns reqId to a pool for reuse. It must be completely unused,
