@@ -193,8 +193,34 @@ func (c *conn) writeEndRequest(reqId uint16, appStatus int, protocolStatus uint8
 	return c.writeRecord(typeEndRequest, reqId, b)
 }
 
-func (c *conn) writePairs(recType recType, reqId uint16, pairs map[string]string) error {
-	w := newWriter(c, recType, reqId)
+func (c *conn) writeGetValues(pairs map[string]string) error {
+	return c.writeDiscretePairs(typeGetValues, 0, pairs)
+}
+
+func (c *conn) writeDiscretePairs(recType recType, reqId uint16, pairs map[string]string) error {
+	var rawBytes [512]byte
+	w := bytes.NewBuffer(rawBytes[:0])
+	if err := c.writePairs(w, pairs); err != nil {
+		return err
+	}
+	if err := c.writeRecord(recType, reqId, w.Bytes()); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *conn) writeParams(reqId uint16, pairs map[string]string) error {
+	w := newWriter(c, typeParams, reqId)
+	if err := c.writePairs(w, pairs); err != nil {
+		return err
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *conn) writePairs(w io.Writer, pairs map[string]string) error {
 	b := make([]byte, 8)
 	for k, v := range pairs {
 		n := encodeSize(b, uint32(len(k)))
@@ -202,14 +228,13 @@ func (c *conn) writePairs(recType recType, reqId uint16, pairs map[string]string
 		if _, err := w.Write(b[:n]); err != nil {
 			return err
 		}
-		if _, err := w.WriteString(k); err != nil {
+		if _, err := io.WriteString(w, k); err != nil {
 			return err
 		}
-		if _, err := w.WriteString(v); err != nil {
+		if _, err := io.WriteString(w, v); err != nil {
 			return err
 		}
 	}
-	w.Close()
 	return nil
 }
 

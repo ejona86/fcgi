@@ -382,7 +382,7 @@ func NewClient(netConn io.ReadWriteCloser) (*Client, error) {
 		"FCGI_MAX_REQS ":  "",
 		"FCGI_MPXS_CONNS": "",
 	}
-	if err := h.conn.writePairs(typeGetValues, 0, values); err != nil {
+	if err := h.conn.writeGetValues(values); err != nil {
 		h.conn.Close()
 		return nil, err
 	}
@@ -479,6 +479,11 @@ func (h *host) handleRecord(rec *record) error {
 		// management record
 		switch rec.h.Type {
 		case typeGetValuesResult:
+			// Although this record is discrete, many
+			// implementations (including Go's child) write it as
+			// if it were a stream record. That mainly means being
+			// able to handle an unrequested and empty
+			// typeGetValuesResult.
 			h.mutex.Lock()
 			if !h.handshaked {
 				h.handshaked = true
@@ -615,7 +620,7 @@ func (hr *hostRequest) handle(env map[string]string, req io.ReadCloser) error {
 		return err
 	}
 
-	if err := hr.host.conn.writePairs(typeParams, hr.reqId, env); err != nil {
+	if err := hr.host.conn.writeParams(hr.reqId, env); err != nil {
 		return err
 	}
 
