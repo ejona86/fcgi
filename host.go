@@ -574,7 +574,8 @@ type hostRequest struct {
 	stdoutClose sync.Once // first close should win
 
 	// state for reader
-	stdoutEOS bool // stdoutEOS is true after receiving empty frame for stdout
+	stdoutEOS    bool // stdoutEOS is true after receiving empty frame for stdout
+	abortedAsync bool // aborted is true if an async abort has already occurred
 
 	// mutex should be held when accessing the following fields
 	mutex           sync.Mutex
@@ -668,6 +669,10 @@ func (hr *hostRequest) handleRecord(rec *record) error {
 		} else {
 			// This may take a long time
 			if _, err := hr.stdout.Write(content); err != nil {
+				if hr.abortedAsync {
+					return nil
+				}
+				hr.abortedAsync = true
 				// sending from read loop could cause deadlock.
 				// If this turns out to be frequent, it could
 				// be replaced with a dedicated goroutine that
