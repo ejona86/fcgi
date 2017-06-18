@@ -374,7 +374,7 @@ func NewClient(netConn io.ReadWriteCloser) (*Client, error) {
 			reqs:          make(map[uint16]*hostRequest),
 		},
 	}
-	h := c.host
+	h := &c.host
 	h.reqIdCond.L = &h.mutex
 	go h.readLoop()
 
@@ -644,8 +644,10 @@ func (hr *hostRequest) handle(env map[string]string, req io.ReadCloser) error {
 			if err == nil {
 				err = body.Close()
 			} else {
-				hr.tryClose(err)
 				hr.host.conn.writeAbortRequest(hr.reqId)
+			}
+			if err != nil {
+				hr.tryClose(err)
 			}
 			outEnded()
 		}()
