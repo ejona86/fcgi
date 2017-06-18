@@ -368,10 +368,9 @@ func (c *Client) Err() error {
 func NewClient(netConn io.ReadWriteCloser) (*Client, error) {
 	c := &Client{
 		host{
-			conn:          newConn(netConn),
-			handshakeChan: make(chan struct{}),
-			maxReqs:       math.MaxUint16,
-			reqs:          make(map[uint16]*hostRequest),
+			conn:    newConn(netConn),
+			maxReqs: 1,
+			reqs:    make(map[uint16]*hostRequest),
 		},
 	}
 	h := &c.host
@@ -386,7 +385,6 @@ func NewClient(netConn io.ReadWriteCloser) (*Client, error) {
 		h.conn.Close()
 		return nil, err
 	}
-	<-h.handshakeChan
 
 	return c, nil
 }
@@ -396,14 +394,12 @@ func NewClient(netConn io.ReadWriteCloser) (*Client, error) {
 // readers to consume since fcgi lacks per-request flow control.
 type host struct {
 	conn *conn
-	// handshakeChan is closed when handshake is complete.
-	handshakeChan chan struct{}
+
+	// handshaked is true when handshake is complete.
+	handshaked bool
 
 	// mutex should be held when accessing the following fields.
 	mutex sync.Mutex
-	// handshaked is true when handshake is complete, to avoid closing
-	// handshakeChan multiple times.
-	handshaked bool
 	// reqIdCond for coordinating when new reqIds may be available, or closed.
 	reqIdCond sync.Cond
 	// maxReqs is the maximum number of requests the fcgi application
@@ -456,10 +452,6 @@ func (h *host) readLoop() {
 	}
 
 	h.mutex.Lock()
-	if !h.handshaked {
-		h.handshaked = true
-		close(h.handshakeChan)
-	}
 	if h.closed == nil {
 		h.closed = err
 		h.reqIdCond.Broadcast()
@@ -484,20 +476,26 @@ func (h *host) handleRecord(rec *record) error {
 			// if it were a stream record. That mainly means being
 			// able to handle an unrequested and empty
 			// typeGetValuesResult.
-			h.mutex.Lock()
-			if !h.handshaked {
-				h.handshaked = true
-				close(h.handshakeChan)
+			if h.handshaked {
+				// Ignore any later results, since they weren't
+				// requested and are likely just empty
+				return nil
 			}
+			h.handshaked = true
 			values := readPairs(rec.content())
+			maxReqs := uint16(math.MaxUint16)
+			mpxsConns := false
 			if v, ok := intFromMap(values, "FCGI_MAX_REQS"); ok && uint16(v) > 1 {
-				h.maxReqs = uint16(v)
-				h.reqIdCond.Broadcast()
+				maxReqs = uint16(v)
 			}
 			if v, ok := intFromMap(values, "FCGI_MPXS_CONNS"); ok {
-				if v == 0 {
-					h.maxReqs = 1
-				}
+				mpxsConns = v != 0
+			}
+
+			h.mutex.Lock()
+			if mpxsConns {
+				h.maxReqs = maxReqs
+				h.reqIdCond.Broadcast()
 			}
 			h.mutex.Unlock()
 		default:
