@@ -378,7 +378,7 @@ func NewClient(netConn io.ReadWriteCloser) (*Client, error) {
 	go h.readLoop()
 
 	values := map[string]string{
-		"FCGI_MAX_REQS ":  "",
+		"FCGI_MAX_REQS":   "",
 		"FCGI_MPXS_CONNS": "",
 	}
 	if err := h.conn.writeGetValues(values); err != nil {
