@@ -121,6 +121,10 @@ type conn struct {
 	// to avoid allocations
 	buf bytes.Buffer
 	h   header
+
+	// to avoid allocations
+	paramsW  *bufio.Writer
+	paramsMu sync.Mutex
 }
 
 func newConn(rwc io.ReadWriteCloser) *conn {
@@ -210,7 +214,13 @@ func (c *conn) writeDiscretePairs(recType recType, reqId uint16, pairs map[strin
 }
 
 func (c *conn) writeParams(reqId uint16, pairs map[string]string) error {
-	w := newWriter(c, typeParams, reqId)
+	c.paramsMu.Lock()
+	defer c.paramsMu.Unlock()
+	if c.paramsW == nil {
+		// Since only the host writes params, create lazily
+		c.paramsW = bufio.NewWriterSize(nil, maxWrite)
+	}
+	w := newWriterProvideBuf(c, typeParams, reqId, c.paramsW)
 	if err := c.writePairs(w, pairs); err != nil {
 		return err
 	}
@@ -312,8 +322,13 @@ func (w *bufWriter) Close() error {
 }
 
 func newWriter(c *conn, recType recType, reqId uint16) *bufWriter {
+	w := bufio.NewWriterSize(nil, maxWrite)
+	return newWriterProvideBuf(c, recType, reqId, w)
+}
+
+func newWriterProvideBuf(c *conn, recType recType, reqId uint16, w *bufio.Writer) *bufWriter {
 	s := &streamWriter{c: c, recType: recType, reqId: reqId}
-	w := bufio.NewWriterSize(s, maxWrite)
+	w.Reset(s)
 	return &bufWriter{s, w}
 }
 

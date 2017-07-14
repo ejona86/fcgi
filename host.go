@@ -633,8 +633,7 @@ func (hr *hostRequest) handle(env map[string]string, req io.ReadCloser) error {
 
 	}
 	if req == nil {
-		body := newWriter(hr.host.conn, typeStdin, hr.reqId)
-		if err := body.Close(); err != nil {
+		if err := hr.host.conn.writeRecord(typeStdin, hr.reqId, nil); err != nil {
 			return err
 		}
 		outEnded()
