@@ -742,12 +742,13 @@ func (hr *hostRequest) allDoneLocked() bool {
 func (hr *hostRequest) abortReader() error {
 	hr.mutex.Lock()
 	needToAbort := !hr.inEnded && hr.outEnded && !hr.abortInProgress
-	hr.abortInProgress = needToAbort
-	hr.mutex.Unlock()
-
 	if !needToAbort {
+		hr.mutex.Unlock()
 		return nil
 	}
+	hr.abortInProgress = true
+	hr.mutex.Unlock()
+
 	// outEnded is already true
 	err := hr.host.conn.writeAbortRequest(hr.reqId)
 
