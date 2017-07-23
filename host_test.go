@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http/fcgi"
 	"net/http/httptest"
+	"sync"
 	"testing"
 )
 
@@ -75,6 +76,40 @@ func BenchmarkGet(b *testing.B) {
 		rw := &httptest.ResponseRecorder{}
 		handler.ServeHTTP(rw, req)
 	}
+}
+
+func BenchmarkConcurrentGet(b *testing.B) {
+	hostConn, childConn := net.Pipe()
+	l := singleConnectionListener{childConn}
+	fcgi.Serve(&l, nil)
+	client, err := NewClient(hostConn)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer client.Close()
+	handler := &Handler{
+		Dialer: fixedDialer{client},
+		Root:   "/some",
+	}
+	workChan := make(chan struct{})
+	concurrency := 5
+	var wg sync.WaitGroup
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func() {
+			req := httptest.NewRequest("GET", "http://example.com/some/path", nil)
+			for range workChan {
+				rw := &httptest.ResponseRecorder{}
+				handler.ServeHTTP(rw, req)
+			}
+			wg.Done()
+		}()
+	}
+	for i := 0; i < b.N; i++ {
+		workChan <- struct{}{}
+	}
+	close(workChan)
+	wg.Wait()
 }
 
 type fixedDialer struct {
