@@ -143,8 +143,9 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		host:   &client.host,
 		stderr: h.stderr(),
 	}
-	client.host.reserveReqId(hostReq)
 	stdoutRead := hostReq.stdoutPipe()
+	// At this point forward, hostReq may be accessed by another goroutine
+	client.host.reserveReqId(hostReq)
 	var body io.ReadCloser
 	if req.ContentLength != 0 {
 		body = req.Body
@@ -419,8 +420,8 @@ type host struct {
 
 func (h *host) shutdown() error {
 	h.mutex.Lock()
-	defer h.mutex.Unlock()
 	if h.closed != nil {
+		h.mutex.Unlock()
 		return nil
 	}
 	h.closed = errors.New("fcgi: client closed")
@@ -428,6 +429,7 @@ func (h *host) shutdown() error {
 	for _, hr := range h.reqs {
 		hr.tryClose(h.closed)
 	}
+	h.mutex.Unlock()
 	// This will cause reader goroutine to stop
 	return h.conn.Close()
 }
@@ -452,15 +454,28 @@ func (h *host) readLoop() {
 	}
 
 	h.mutex.Lock()
+	// Stop permitting new requests
 	if h.closed == nil {
 		h.closed = err
 		h.reqIdCond.Broadcast()
 	}
-	reqs := h.reqs
-	h.reqs = nil
+	hrs := make([]*hostRequest, 0, len(h.reqs))
+	for _, hr := range h.reqs {
+		hrs = append(hrs, hr)
+	}
 	h.mutex.Unlock()
-
-	for _, hr := range reqs {
+	for _, hr := range hrs {
+		hr.mutex.Lock()
+		if hr.inEnded {
+			hr.mutex.Unlock()
+			continue
+		}
+		hr.inEnded = true
+		allDone := hr.allDoneLocked()
+		hr.mutex.Unlock()
+		if allDone {
+			h.returnReqId(hr.reqId)
+		}
 		hr.tryClose(err)
 	}
 }
@@ -704,6 +719,7 @@ func (hr *hostRequest) handleRecord(rec *record) error {
 
 		var er endRequest
 		if err := er.read(rec.content()); err != nil {
+			hr.tryClose(err)
 			return err
 		}
 		if er.protocolStatus != statusRequestComplete {
