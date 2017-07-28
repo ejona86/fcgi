@@ -156,6 +156,8 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	// ServeHTTP does not allow calling the request body concurrently with returning
+	defer hostReq.waitForWriterDone()
 	defer stdoutRead.Close()
 
 	linebody := bufio.NewReaderSize(stdoutRead, 1024)
@@ -591,6 +593,8 @@ type hostRequest struct {
 
 	stdoutClose sync.Once // first close should win
 
+	writerDone sync.WaitGroup
+
 	// state for reader
 	stdoutEOS    bool // stdoutEOS is true after receiving empty frame for stdout
 	abortedAsync bool // aborted is true if an async abort has already occurred
@@ -653,9 +657,13 @@ func (hr *hostRequest) handle(env map[string]string, req io.ReadCloser) error {
 		}
 		outEnded()
 	} else {
+		hr.writerDone.Add(1)
 		go func() {
+			defer hr.writerDone.Done()
 			body := newWriter(hr.host.conn, typeStdin, hr.reqId)
-			_, err := io.Copy(body, req)
+			// Since ServeHTTP() can't return until this goroutine completes,
+			// try to return promptly if the response completes early.
+			_, err := io.Copy(body, checkInEndedReader{req, hr})
 			if err1 := req.Close(); err == nil {
 				err = err1
 			}
@@ -748,6 +756,10 @@ func (hr *hostRequest) handleRecord(rec *record) error {
 	}
 }
 
+func (hr *hostRequest) waitForWriterDone() {
+	hr.writerDone.Wait()
+}
+
 // allDoneLocked returns true if this request will no longer use its reqId.
 // mutex must be held when calling this function.
 func (hr *hostRequest) allDoneLocked() bool {
@@ -776,6 +788,22 @@ func (hr *hostRequest) abortReader() error {
 		hr.host.returnReqId(hr.reqId)
 	}
 	return err
+}
+
+type checkInEndedReader struct {
+	io.ReadCloser
+	hr *hostRequest
+}
+
+func (r checkInEndedReader) Read(p []byte) (int, error) {
+	r.hr.mutex.Lock()
+	stop := r.hr.inEnded
+	r.hr.mutex.Unlock()
+
+	if stop {
+		return 0, errors.New("response complete; request implicitly closed")
+	}
+	return r.ReadCloser.Read(p)
 }
 
 type abortReader struct {
