@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"net"
+	"net/http"
 	"net/http/fcgi"
 	"net/http/httptest"
 	"sync"
@@ -73,6 +74,39 @@ func BenchmarkGet(b *testing.B) {
 	}
 	req := httptest.NewRequest("GET", "http://example.com/some/path", nil)
 	for i := 0; i < b.N; i++ {
+		rw := &httptest.ResponseRecorder{}
+		handler.ServeHTTP(rw, req)
+	}
+}
+
+func BenchmarkPost(b *testing.B) {
+	readBuffer := make([]byte, 32*1024)
+	childHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		for {
+			if _, err := r.Body.Read(readBuffer); err != nil {
+				break
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+
+	hostConn, childConn := net.Pipe()
+	l := singleConnectionListener{childConn}
+	fcgi.Serve(&l, childHandler)
+	client, err := NewClient(hostConn)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer client.Close()
+	handler := &Handler{
+		Dialer: fixedDialer{client},
+		Root:   "/some",
+	}
+	body := make([]byte, 100)
+	for i := 0; i < b.N; i++ {
+		reqBody := bytes.NewBuffer(body)
+		req := httptest.NewRequest(
+			"POST", "http://example.com/some/path", reqBody)
 		rw := &httptest.ResponseRecorder{}
 		handler.ServeHTTP(rw, req)
 	}
