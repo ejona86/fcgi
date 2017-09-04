@@ -1,21 +1,15 @@
-// Copyright 2011 The Go Authors. All rights reserved.
+// Copyright 2011 The Go Authors and Copyright 2017 Eric Anderson. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// This file implements the host side of CGI (being the webserver
-// parent process).
-
-// Package cgi implements CGI (Common Gateway Interface) as specified
-// in RFC 3875.
-//
-// Note that using CGI means starting a new process to handle each
-// request, which is typically less efficient than using a
-// long-running server. This package is intended primarily for
-// compatibility with existing systems.
 package fcgi
+
+// This file implements the host side of FastCGI (being the webserver
+// that connects as a client).
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -23,43 +17,24 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"regexp"
-	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 var trailingPort = regexp.MustCompile(`:([0-9]+)$`)
 
-var osDefaultInheritEnv = map[string][]string{
-	"darwin":  {"DYLD_LIBRARY_PATH"},
-	"freebsd": {"LD_LIBRARY_PATH"},
-	"hpux":    {"LD_LIBRARY_PATH", "SHLIB_PATH"},
-	"irix":    {"LD_LIBRARY_PATH", "LD_LIBRARYN32_PATH", "LD_LIBRARY64_PATH"},
-	"linux":   {"LD_LIBRARY_PATH"},
-	"openbsd": {"LD_LIBRARY_PATH"},
-	"solaris": {"LD_LIBRARY_PATH", "LD_LIBRARY_PATH_32", "LD_LIBRARY_PATH_64"},
-	"windows": {"SystemRoot", "COMSPEC", "PATHEXT", "WINDIR"},
-}
-
 // Handler runs an executable in a subprocess with a CGI environment.
 type Handler struct {
+	Dialer Dialer // dialer for each request
+
 	Path string // path to the CGI executable
 	Root string // root URI prefix of handler or empty for "/"
 
-	// Dir specifies the CGI executable's working directory.
-	// If Dir is empty, the base directory of Path is used.
-	// If Path has no base directory, the current working
-	// directory is used.
-	Dir string
-
-	Env        []string    // extra environment variables to set, if any, as "key=value"
-	InheritEnv []string    // environment variables to inherit from host, as "key"
-	Logger     *log.Logger // optional log for errors or nil to use log.Print
-	Args       []string    // optional arguments to pass to child process
-	Stderr     io.Writer   // optional stderr for the child process; nil means os.Stderr
+	Env    []string    // extra environment variables to set, if any, as "key=value"
+	Logger *log.Logger // optional log for errors or nil to use log.Print
+	Stderr io.Writer   // optional stderr for the child process; nil means os.Stderr
 
 	// PathLocationHandler specifies the root http Handler that
 	// should handle internal redirects when the CGI process
@@ -77,31 +52,6 @@ func (h *Handler) stderr() io.Writer {
 		return h.Stderr
 	}
 	return os.Stderr
-}
-
-// removeLeadingDuplicates remove leading duplicate in environments.
-// It's possible to override environment like following.
-//    cgi.Handler{
-//      ...
-//      Env: []string{"SCRIPT_FILENAME=foo.php"},
-//    }
-func removeLeadingDuplicates(env []string) (ret []string) {
-	for i, e := range env {
-		found := false
-		if eq := strings.IndexByte(e, '='); eq != -1 {
-			keq := e[:eq+1] // "key="
-			for _, e2 := range env[i+1:] {
-				if strings.HasPrefix(e2, keq) {
-					found = true
-					break
-				}
-			}
-		}
-		if !found {
-			ret = append(ret, e)
-		}
-	}
-	return
 }
 
 func (h *Handler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
@@ -172,39 +122,8 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		env = append(env, "CONTENT_TYPE="+ctype)
 	}
 
-	envPath := os.Getenv("PATH")
-	if envPath == "" {
-		envPath = "/bin:/usr/bin:/usr/ucb:/usr/bsd:/usr/local/bin"
-	}
-	env = append(env, "PATH="+envPath)
-
-	for _, e := range h.InheritEnv {
-		if v := os.Getenv(e); v != "" {
-			env = append(env, e+"="+v)
-		}
-	}
-
-	for _, e := range osDefaultInheritEnv[runtime.GOOS] {
-		if v := os.Getenv(e); v != "" {
-			env = append(env, e+"="+v)
-		}
-	}
-
 	if h.Env != nil {
 		env = append(env, h.Env...)
-	}
-
-	env = removeLeadingDuplicates(env)
-
-	var cwd, path string
-	if h.Dir != "" {
-		path = h.Path
-		cwd = h.Dir
-	} else {
-		cwd, path = filepath.Split(h.Path)
-	}
-	if cwd == "" {
-		cwd = "."
 	}
 
 	internalError := func(err error) {
@@ -212,33 +131,55 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		h.printf("CGI error: %v", err)
 	}
 
-	cmd := &exec.Cmd{
-		Path:   path,
-		Args:   append([]string{h.Path}, h.Args...),
-		Dir:    cwd,
-		Env:    env,
-		Stderr: h.stderr(),
+	conn, err := h.Dialer.Dial(req.Context())
+	if err != nil {
+		internalError(err)
+		return
 	}
+	if deadline, ok := req.Context().Deadline(); ok {
+		conn.SetDeadline(deadline)
+	}
+	// TODO: observe context.Done()?
+	host := &host{
+		conn:   newConn(conn),
+		stderr: h.stderr(),
+	}
+
+	var body io.ReadCloser
 	if req.ContentLength != 0 {
-		cmd.Stdin = req.Body
-	}
-	stdoutRead, err := cmd.StdoutPipe()
-	if err != nil {
-		internalError(err)
-		return
+		body = req.Body
 	}
 
-	err = cmd.Start()
+	err = host.handle(envSliceToMap(env), body)
 	if err != nil {
 		internalError(err)
+		conn.Close()
 		return
 	}
-	if hook := testHookStartProcess; hook != nil {
-		hook(cmd.Process)
-	}
-	defer cmd.Wait()
-	defer stdoutRead.Close()
+	var graceful bool
+	defer func() {
+		if graceful {
+			// Gracefully wait for the request to end, then close the
+			// connection. Report any errors
+			err := host.wait()
+			// FYI: If err == nul, at this point it would be safe to re-use the
+			// connection and the reqId
+			if err2 := conn.Close(); err != nil {
+				err = err2
+			}
+			if err != nil {
+				h.printf("fcgi: final error: %v", err)
+			}
+		} else {
+			// Tear down as quickly as possible. Ignore any errors, since we've
+			// already reported an error and this teardown will produce more.
+			// Make sure Close() happens before wait() to guarantee wait() will return
+			conn.Close()
+			host.wait()
+		}
+	}()
 
+	var stdoutRead io.Reader = host
 	linebody := bufio.NewReaderSize(stdoutRead, 1024)
 	headers := make(http.Header)
 	statusCode := 0
@@ -248,7 +189,7 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		line, isPrefix, err := linebody.ReadLine()
 		if isPrefix {
 			rw.WriteHeader(http.StatusInternalServerError)
-			h.printf("cgi: long header line from subprocess.")
+			h.printf("fcgi: long header line from subprocess.")
 			return
 		}
 		if err == io.EOF {
@@ -256,7 +197,7 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		}
 		if err != nil {
 			rw.WriteHeader(http.StatusInternalServerError)
-			h.printf("cgi: error reading headers: %v", err)
+			h.printf("fcgi: error reading headers: %v", err)
 			return
 		}
 		if len(line) == 0 {
@@ -266,7 +207,7 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		headerLines++
 		parts := strings.SplitN(string(line), ":", 2)
 		if len(parts) < 2 {
-			h.printf("cgi: bogus header line: %s", string(line))
+			h.printf("fcgi: bogus header line: %s", string(line))
 			continue
 		}
 		header, val := parts[0], parts[1]
@@ -275,13 +216,13 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		switch {
 		case header == "Status":
 			if len(val) < 3 {
-				h.printf("cgi: bogus status (short): %q", val)
+				h.printf("fcgi: bogus status (short): %q", val)
 				return
 			}
 			code, err := strconv.Atoi(val[0:3])
 			if err != nil {
-				h.printf("cgi: bogus status: %q", val)
-				h.printf("cgi: line was %q", line)
+				h.printf("fcgi: bogus status: %q", val)
+				h.printf("fcgi: line was %q", line)
 				return
 			}
 			statusCode = code
@@ -291,7 +232,7 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	}
 	if headerLines == 0 || !sawBlankLine {
 		rw.WriteHeader(http.StatusInternalServerError)
-		h.printf("cgi: no headers")
+		h.printf("fcgi: no headers")
 		return
 	}
 
@@ -307,7 +248,7 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 
 	if statusCode == 0 && headers.Get("Content-Type") == "" {
 		rw.WriteHeader(http.StatusInternalServerError)
-		h.printf("cgi: missing required Content-Type in headers")
+		h.printf("fcgi: missing required Content-Type in headers")
 		return
 	}
 
@@ -328,15 +269,10 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 
 	_, err = io.Copy(rw, linebody)
 	if err != nil {
-		h.printf("cgi: copy error: %v", err)
-		// And kill the child CGI process so we don't hang on
-		// the deferred cmd.Wait above if the error was just
-		// the client (rw) going away. If it was a read error
-		// (because the child died itself), then the extra
-		// kill of an already-dead process is harmless (the PID
-		// won't be reused until the Wait above).
-		cmd.Process.Kill()
+		h.printf("fcgi: copy error: %v", err)
+		return
 	}
+	graceful = true
 }
 
 func (h *Handler) printf(format string, v ...interface{}) {
@@ -351,7 +287,7 @@ func (h *Handler) handleInternalRedirect(rw http.ResponseWriter, req *http.Reque
 	url, err := req.URL.Parse(path)
 	if err != nil {
 		rw.WriteHeader(http.StatusInternalServerError)
-		h.printf("cgi: error resolving local URI path %q: %v", path, err)
+		h.printf("fcgi: error resolving local URI path %q: %v", path, err)
 		return
 	}
 	// TODO: RFC 3875 isn't clear if only GET is supported, but it
@@ -393,63 +329,119 @@ func upperCaseAndUnderscore(r rune) rune {
 	return r
 }
 
-var testHookStartProcess func(*os.Process) // nil except for some tests
+// envSliceToMap converts env slice to map. In case of duplicates, last
+// instance wins.
+func envSliceToMap(env []string) map[string]string {
+	m := make(map[string]string)
+	for _, e := range env {
+		if eq := strings.IndexByte(e, '='); eq != -1 {
+			key := e[:eq]
+			value := e[eq+1:]
+			m[key] = value
+		}
+	}
+	return m
+}
+
+// Dialer creates a connection.
+type Dialer interface {
+	// Dial returns a connection for use, or error if unable
+	Dial(ctx context.Context) (net.Conn, error)
+}
+
+const reqId = 1
+
+var endedError error = errors.New("response complete; request implicitly closed")
 
 type host struct {
-	conn      *conn
-	stderr    io.Writer
-	reqId     uint16
-	out       []byte
-	outClosed bool  // whether empty frame for out received
-	ended     bool  // whether typeEndRequest has been received or there was a fcgi-level failure
-	err       error // non-nil when a fcgi-level failure occurred
+	conn   *conn
+	stderr io.Writer
+
+	stdout       []byte
+	stdoutClosed bool // whether empty frame for stdout received
+	// protects req from being used after Handle returns
+	writerDone sync.WaitGroup
+
+	mu sync.Mutex
+	// whether typeEndRequest has been received or there was a fcgi-level
+	// failure. ended may only be modified on the stdout-reading goroutine. mu
+	// must be held when modifying or reading outside of the stdout-reading
+	// goroutine
+	ended bool
+	// mu must be held when reading or writing writerErr
+	writerErr error
 }
 
 // handle issues an http request with cgi-style env headers and req body,
 // returning HTTP-encoded response.
-func (h *host) handle(env map[string]string, req io.Reader) error {
-	if h.reqId == 0 {
-		panic("reqId must be non-zero")
-	}
-	// Reset state for reuse
-	h.out = nil
-	h.outClosed = false
-	h.ended = false
-	h.err = nil
-
-	if err := h.conn.writeBeginRequest(h.reqId, roleResponder, flagKeepConn); err != nil {
+func (h *host) handle(env map[string]string, req io.ReadCloser) error {
+	if err := h.conn.writeBeginRequest(reqId, roleResponder, flagKeepConn); err != nil {
 		return err
 	}
 
-	if err := h.conn.writePairs(typeParams, h.reqId, env); err != nil {
+	if err := h.conn.writePairs(typeParams, reqId, env); err != nil {
 		return err
 	}
 
-	body := newWriter(h.conn, typeStdin, h.reqId)
-	if req != nil {
-		if _, err := io.Copy(body, req); err != nil {
+	if req == nil {
+		if err := h.conn.writeRecord(typeStdin, reqId, nil); err != nil {
 			return err
 		}
-	}
-	if err := body.Close(); err != nil {
-		return err
+	} else {
+		// must send from separate goroutine to avoid deadlock. The
+		// earlier writes were safe because there were no outstanding
+		// requests (and so the fcgi server couldn't be blocked on a
+		// write)
+		h.writerDone.Add(1)
+		go func() {
+			defer h.writerDone.Done()
+			body := &streamWriter{c: h.conn, recType: typeStdin, reqId: reqId}
+			// Since ServeHTTP() can't return until this goroutine completes,
+			// try to return promptly if the response completes early.
+			_, err := io.Copy(body, checkEndedReader{req, h})
+			if err == endedError {
+				err = nil
+			}
+			if err1 := req.Close(); err == nil {
+				err = err1
+			}
+			if err != nil {
+				// Set writerErr before writeAbortRequest, so it is set for receiving typeEndRequest
+				h.mu.Lock()
+				h.writerErr = err
+				h.mu.Unlock()
+				// Squelch returned error; already reporting an error
+				h.conn.writeAbortRequest(reqId)
+				return
+			}
+			err = body.Close()
+			if err != nil {
+				h.mu.Lock()
+				h.writerErr = err
+				h.mu.Unlock()
+			}
+		}()
 	}
 
 	return nil
 }
 
-func (h *host) stdoutPipe() io.ReadCloser {
-	return &stdoutReader{h}
-}
-
 func (h *host) readAndProcess() error {
+	if h.ended {
+		panic("already ended")
+	}
+	// TODO: this does a really large allocation frequently
 	var rec record
 	if err := rec.read(h.conn.rwc); err != nil {
+		h.mu.Lock()
+		h.ended = true
+		h.mu.Unlock()
 		return err
 	}
 	if err := h.handleRecord(&rec); err != nil {
-		h.err = err
+		h.mu.Lock()
 		h.ended = true
+		h.mu.Unlock()
 		return err
 	}
 	return nil
@@ -458,11 +450,11 @@ func (h *host) readAndProcess() error {
 func (h *host) handleRecord(rec *record) error {
 	if rec.h.Id == 0 {
 		// management record
-		// We won't receive typeGetValuesResult since we don't send typeGetValues
-		// TODO: log for typeUnknownType?
-		return nil
+		// We shouldn't receive typeGetValuesResult since we don't send
+		// typeGetValues
+		return fmt.Errorf("fcgi: unexpected management record: %d", rec.h.Type)
 	}
-	if rec.h.Id != h.reqId {
+	if rec.h.Id != reqId {
 		// Applications must ignore unknown requestIds, but web servers don't
 		return errors.New("fcgi: received frame for unexpected requestId")
 	}
@@ -472,9 +464,12 @@ func (h *host) handleRecord(rec *record) error {
 		content := rec.content()
 		if len(content) == 0 {
 			// End of stream
-			h.outClosed = true
+			h.stdoutClosed = true
 		} else {
-			h.out = append(h.out, content...)
+			if len(h.stdout) > 0 {
+				panic("stdout not empty!")
+			}
+			h.stdout = content
 		}
 		return nil
 	case typeStderr:
@@ -487,79 +482,76 @@ func (h *host) handleRecord(rec *record) error {
 		}
 		return nil
 	case typeEndRequest:
-		if h.ended {
-			return errors.New("fcgi: received END_REQUEST for already-ended request")
-		}
+		h.mu.Lock()
 		h.ended = true
+		writerErr := h.writerErr
+		h.mu.Unlock()
 		var er endRequest
 		if err := er.read(rec.content()); err != nil {
 			return err
 		}
+		if writerErr != nil {
+			return writerErr
+		}
 		if er.protocolStatus != statusRequestComplete {
-			// TODO: translate int to name
-			return fmt.Errorf("fcgi: protocol status: %d", er.protocolStatus)
+			if er.protocolStatus < uint8(len(statusName)) {
+				return fmt.Errorf("fcgi: protocol status: %s", statusName[er.protocolStatus])
+			} else {
+				return fmt.Errorf("fcgi: protocol status: %d", er.protocolStatus)
+			}
 		}
 		if er.appStatus != 0 {
 			return fmt.Errorf("fcgi: application exit code: %d", er.appStatus)
 		}
-		if !h.outClosed {
+		if !h.stdoutClosed {
 			return errors.New("fcgi: request completed before stdout ended")
 		}
 		return nil
 	default:
-		// Applications have a graceful way to report unknown frame types, but web servers don't
+		// Applications have a graceful way to report unknown frame types, but
+		// web servers don't
 		return fmt.Errorf("fcgi: received unknown frame type: %d", rec.h.Type)
 	}
 }
 
-func (h *host) kill() error {
-	if h.ended {
-		return nil
-	}
-	if err := h.conn.writeAbortRequest(h.reqId); err != nil {
-		return err
-	}
-	return nil
-}
-
 func (h *host) wait() error {
+	var err error
 	for !h.ended {
-		h.readAndProcess()
-		h.out = nil
+		err = h.readAndProcess()
+		h.stdout = nil
 	}
-	return h.err
+	h.writerDone.Wait()
+	return err
 }
 
-type stdoutReader struct {
+func (h *host) Read(p []byte) (n int, err error) {
+	for {
+		if len(h.stdout) > 0 {
+			n = copy(p, h.stdout)
+			h.stdout = h.stdout[n:]
+			return
+		}
+		if h.stdoutClosed {
+			return 0, io.EOF
+		}
+		if err := h.readAndProcess(); err != nil {
+			return 0, err
+		}
+	}
+}
+
+type checkEndedReader struct {
+	io.ReadCloser
 	h *host
 }
 
-func (r *stdoutReader) Read(p []byte) (n int, err error) {
-	for {
-		if len(r.h.out) > 0 {
-			n = copy(p, r.h.out)
-			r.h.out = r.h.out[n:]
-			return
-		}
-		if r.h.outClosed {
-			return 0, io.EOF
-		}
-		if r.h.err != nil {
-			return 0, r.h.err
-		}
-		r.h.readAndProcess()
-	}
-}
+func (r checkEndedReader) Read(p []byte) (int, error) {
+	r.h.mu.Lock()
+	stop := r.h.ended
+	r.h.mu.Unlock()
 
-func (r *stdoutReader) Close() error {
-	if r.h.outClosed {
-		return nil
+	if stop {
+		return 0, endedError
 	}
-	if r.h.err != nil {
-		return r.h.err
-	}
-	if err := r.h.conn.writeAbortRequest(r.h.reqId); err != nil {
-		return err
-	}
-	return nil
+	return r.ReadCloser.Read(p)
 }

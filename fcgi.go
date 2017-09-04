@@ -62,6 +62,13 @@ const (
 	statusUnknownRole
 )
 
+var statusName []string = []string{
+	"FCGI_REQUEST_COMPLETE",
+	"FCGI_CANT_MPX_CONN",
+	"FCGI_OVERLOADED",
+	"FCGI_UNKNOWN_ROLE",
+}
+
 type header struct {
 	Version       uint8
 	Type          recType
@@ -83,6 +90,21 @@ func (br *beginRequest) read(content []byte) error {
 	}
 	br.role = binary.BigEndian.Uint16(content)
 	br.flags = content[2]
+	return nil
+}
+
+type endRequest struct {
+	appStatus      int32
+	protocolStatus uint8
+	reserved       [3]uint8
+}
+
+func (er *endRequest) read(content []byte) error {
+	if len(content) != 8 {
+		return errors.New("fcgi: invalid end request record")
+	}
+	er.appStatus = int32(binary.BigEndian.Uint32(content))
+	er.protocolStatus = content[4]
 	return nil
 }
 
@@ -158,6 +180,17 @@ func (c *conn) writeRecord(recType recType, reqId uint16, b []byte) error {
 	}
 	_, err := c.rwc.Write(c.buf.Bytes())
 	return err
+}
+
+func (c *conn) writeBeginRequest(reqId uint16, role uint16, flags uint8) error {
+	b := make([]byte, 8)
+	binary.BigEndian.PutUint16(b, role)
+	b[2] = flags
+	return c.writeRecord(typeBeginRequest, reqId, b)
+}
+
+func (c *conn) writeAbortRequest(reqId uint16) error {
+	return c.writeRecord(typeAbortRequest, reqId, nil)
 }
 
 func (c *conn) writeEndRequest(reqId uint16, appStatus int, protocolStatus uint8) error {
