@@ -69,6 +69,12 @@ var statusName []string = []string{
 	"FCGI_UNKNOWN_ROLE",
 }
 
+var bufioWriterPool sync.Pool = sync.Pool{
+	New: func() interface{} {
+		return bufio.NewWriterSize(nil, maxWrite)
+	},
+}
+
 type header struct {
 	Version       uint8
 	Type          recType
@@ -201,7 +207,9 @@ func (c *conn) writeEndRequest(reqId uint16, appStatus int, protocolStatus uint8
 }
 
 func (c *conn) writePairs(recType recType, reqId uint16, pairs map[string]string) error {
-	w := newWriter(c, recType, reqId)
+	bufioWriter := bufioWriterPool.Get().(*bufio.Writer)
+	defer bufioWriterPool.Put(bufioWriter)
+	w := newWriterProvideBuf(c, recType, reqId, bufioWriter)
 	b := make([]byte, 8)
 	for k, v := range pairs {
 		n := encodeSize(b, uint32(len(k)))
@@ -269,8 +277,13 @@ func (w *bufWriter) Close() error {
 }
 
 func newWriter(c *conn, recType recType, reqId uint16) *bufWriter {
+	w := bufio.NewWriterSize(nil, maxWrite)
+	return newWriterProvideBuf(c, recType, reqId, w)
+}
+
+func newWriterProvideBuf(c *conn, recType recType, reqId uint16, w *bufio.Writer) *bufWriter {
 	s := &streamWriter{c: c, recType: recType, reqId: reqId}
-	w := bufio.NewWriterSize(s, maxWrite)
+	w.Reset(s)
 	return &bufWriter{s, w}
 }
 
