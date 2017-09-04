@@ -143,6 +143,7 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	host := &host{
 		conn:   newConn(conn),
 		stderr: h.stderr(),
+		rec:    recordPool.Get().(*record),
 	}
 
 	var body io.ReadCloser
@@ -353,9 +354,16 @@ const reqId = 1
 
 var endedError error = errors.New("response complete; request implicitly closed")
 
+var recordPool sync.Pool = sync.Pool{
+	New: func() interface{} {
+		return &record{}
+	},
+}
+
 type host struct {
 	conn   *conn
 	stderr io.Writer
+	rec    *record
 
 	stdout       []byte
 	stdoutClosed bool // whether empty frame for stdout received
@@ -430,18 +438,20 @@ func (h *host) readAndProcess() error {
 	if h.ended {
 		panic("already ended")
 	}
-	// TODO: this does a really large allocation frequently
-	var rec record
-	if err := rec.read(h.conn.rwc); err != nil {
+	if err := h.rec.read(h.conn.rwc); err != nil {
 		h.mu.Lock()
 		h.ended = true
 		h.mu.Unlock()
+		recordPool.Put(h.rec)
+		h.rec = nil
 		return err
 	}
-	if err := h.handleRecord(&rec); err != nil {
+	if err := h.handleRecord(h.rec); err != nil {
 		h.mu.Lock()
 		h.ended = true
 		h.mu.Unlock()
+		recordPool.Put(h.rec)
+		h.rec = nil
 		return err
 	}
 	return nil
@@ -486,6 +496,9 @@ func (h *host) handleRecord(rec *record) error {
 		h.ended = true
 		writerErr := h.writerErr
 		h.mu.Unlock()
+		recordPool.Put(h.rec)
+		h.rec = nil
+
 		var er endRequest
 		if err := er.read(rec.content()); err != nil {
 			return err
