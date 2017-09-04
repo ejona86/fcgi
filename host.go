@@ -131,6 +131,12 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		h.printf("CGI error: %v", err)
 	}
 
+	var dialer poolableDialer
+	if d, ok := h.Dialer.(poolableDialer); ok {
+		dialer = d
+	} else {
+		dialer = poolableDialerAdapter{h.Dialer}
+	}
 	conn, err := h.Dialer.Dial(req.Context())
 	if err != nil {
 		internalError(err)
@@ -165,7 +171,7 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 			err := host.wait()
 			// FYI: If err == nul, at this point it would be safe to re-use the
 			// connection and the reqId
-			if err2 := conn.Close(); err != nil {
+			if err2 := dialer.put(conn); err != nil {
 				err = err2
 			}
 			if err != nil {
@@ -348,6 +354,21 @@ func envSliceToMap(env []string) map[string]string {
 type Dialer interface {
 	// Dial returns a connection for use, or error if unable
 	Dial(ctx context.Context) (net.Conn, error)
+}
+
+// poolableDialer allows reusing net.Conns
+type poolableDialer interface {
+	Dialer
+	// put returns conn, allowing it to be returned to a pool or closed
+	put(conn net.Conn) error
+}
+
+type poolableDialerAdapter struct {
+	Dialer
+}
+
+func (d poolableDialerAdapter) put(conn net.Conn) error {
+	return conn.Close()
 }
 
 const reqId = 1

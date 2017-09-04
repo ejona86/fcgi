@@ -61,8 +61,10 @@ func BenchmarkGet(b *testing.B) {
 	tl := newTestListener()
 	defer tl.Close()
 	go fcgi.Serve(tl, nil)
+	pd := newPoolingDialer(tl, 1)
+	defer pd.Close()
 	handler := &Handler{
-		Dialer: tl,
+		Dialer: pd,
 		Root:   "/some",
 	}
 	req := httptest.NewRequest("GET", "http://example.com/some/path", nil)
@@ -86,8 +88,10 @@ func BenchmarkPost(b *testing.B) {
 	tl := newTestListener()
 	defer tl.Close()
 	go fcgi.Serve(tl, childHandler)
+	pd := newPoolingDialer(tl, 1)
+	defer pd.Close()
 	handler := &Handler{
-		Dialer: tl,
+		Dialer: pd,
 		Root:   "/some",
 	}
 	body := make([]byte, 100)
@@ -101,15 +105,18 @@ func BenchmarkPost(b *testing.B) {
 }
 
 func BenchmarkConcurrentGet(b *testing.B) {
+	concurrency := 5
+
 	tl := newTestListener()
 	defer tl.Close()
 	go fcgi.Serve(tl, nil)
+	pd := newPoolingDialer(tl, concurrency)
+	defer pd.Close()
 	handler := &Handler{
-		Dialer: tl,
+		Dialer: pd,
 		Root:   "/some",
 	}
 	workChan := make(chan struct{})
-	concurrency := 5
 	var wg sync.WaitGroup
 	for i := 0; i < concurrency; i++ {
 		wg.Add(1)
@@ -127,4 +134,42 @@ func BenchmarkConcurrentGet(b *testing.B) {
 	}
 	close(workChan)
 	wg.Wait()
+}
+
+func newPoolingDialer(dialer Dialer, size int) *poolingDialer {
+	return &poolingDialer{dialer, make(chan net.Conn, size)}
+}
+
+type poolingDialer struct {
+	Dialer
+	pool chan net.Conn
+}
+
+func (d *poolingDialer) Dial(ctx context.Context) (net.Conn, error) {
+	select {
+	case conn := <-d.pool:
+		return conn, nil
+	default:
+		return d.Dialer.Dial(ctx)
+	}
+}
+
+func (d *poolingDialer) put(conn net.Conn) error {
+	select {
+	case d.pool <- conn:
+		return nil
+	default:
+		return conn.Close()
+	}
+}
+
+func (d *poolingDialer) Close() error {
+	close(d.pool)
+	var err error
+	for conn := range d.pool {
+		if err2 := conn.Close(); err == nil {
+			err = err2
+		}
+	}
+	return err
 }
