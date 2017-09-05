@@ -529,17 +529,13 @@ func (h *host) handleRecord(rec *record) error {
 		}
 		return nil
 	case typeEndRequest:
-		h.mu.Lock()
-		h.ended = true
-		writerErr := h.writerErr
-		h.mu.Unlock()
-		recordPool.Put(h.rec)
-		h.rec = nil
-
 		var er endRequest
 		if err := er.read(rec.content()); err != nil {
 			return err
 		}
+		h.mu.Lock()
+		writerErr := h.writerErr
+		h.mu.Unlock()
 		if writerErr != nil {
 			return writerErr
 		}
@@ -558,6 +554,14 @@ func (h *host) handleRecord(rec *record) error {
 			// spec, but PHP does this... so let's just implicitly close
 			h.stdoutClosed = true
 		}
+
+		// Set ended after any possible errors to avoid double-handling
+		h.mu.Lock()
+		h.ended = true
+		h.mu.Unlock()
+		recordPool.Put(h.rec)
+		h.rec = nil
+
 		return nil
 	default:
 		// Applications have a graceful way to report unknown frame types, but
