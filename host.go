@@ -371,6 +371,22 @@ func (d poolableDialerAdapter) put(conn net.Conn) error {
 	return conn.Close()
 }
 
+type NetDialer struct {
+	Network string
+	Address string
+	// Dialer is the dialer configuration to use. nil implies default
+	// configuration.
+	Dialer *net.Dialer
+}
+
+func (d *NetDialer) Dial(ctx context.Context) (net.Conn, error) {
+	dialer := d.Dialer
+	if dialer == nil {
+		dialer = &net.Dialer{}
+	}
+	return dialer.DialContext(ctx, d.Network, d.Address)
+}
+
 const reqId = 1
 
 var endedError error = errors.New("response complete; request implicitly closed")
