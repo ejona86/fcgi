@@ -554,7 +554,9 @@ func (h *host) handleRecord(rec *record) error {
 			return fmt.Errorf("fcgi: application exit code: %d", er.appStatus)
 		}
 		if !h.stdoutClosed {
-			return errors.New("fcgi: request completed before stdout ended")
+			// Request completed before stdout ended, which is against the
+			// spec, but PHP does this... so let's just implicitly close
+			h.stdoutClosed = true
 		}
 		return nil
 	default:
