@@ -224,7 +224,9 @@ func (c *conn) writePairs(recType recType, reqId uint16, pairs map[string]string
 			return err
 		}
 	}
-	w.Close()
+	if err := w.Close(); err != nil {
+		return err
+	}
 	return nil
 }
 
