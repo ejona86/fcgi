@@ -62,14 +62,14 @@ const (
 	statusUnknownRole
 )
 
-var statusName []string = []string{
+var statusName = []string{
 	"FCGI_REQUEST_COMPLETE",
 	"FCGI_CANT_MPX_CONN",
 	"FCGI_OVERLOADED",
 	"FCGI_UNKNOWN_ROLE",
 }
 
-var bufioWriterPool sync.Pool = sync.Pool{
+var bufioWriterPool = sync.Pool{
 	New: func() interface{} {
 		return bufio.NewWriterSize(nil, maxWrite)
 	},

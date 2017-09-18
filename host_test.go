@@ -666,7 +666,7 @@ func countIos(t *testing.T) (reads, writes int) {
 	return counter.reads, counter.writes
 }
 
-var flakyError error = errors.New("flaky error")
+var errFlaky = errors.New("flaky error")
 
 type flakyReadWriteCloser struct {
 	io.ReadWriteCloser
@@ -683,7 +683,7 @@ func (f *flakyReadWriteCloser) Read(p []byte) (int, error) {
 		f.count++
 		if count == f.ioCount {
 			f.triggered = true
-			return 0, flakyError
+			return 0, errFlaky
 		}
 	}
 	return f.ReadWriteCloser.Read(p)
@@ -695,7 +695,7 @@ func (f *flakyReadWriteCloser) Write(p []byte) (int, error) {
 		f.count++
 		if count == f.ioCount {
 			f.triggered = true
-			return 0, flakyError
+			return 0, errFlaky
 		}
 	}
 	return f.ReadWriteCloser.Write(p)
@@ -709,7 +709,7 @@ func readWriteError(t *testing.T, forWrite bool, ioCount int) {
 		forWrite:        forWrite,
 		ioCount:         ioCount,
 	}
-	if err := rweTrial(t, frwc, bufRead); !strings.Contains(err.Error(), flakyError.Error()) {
+	if err := rweTrial(t, frwc, bufRead); !strings.Contains(err.Error(), errFlaky.Error()) {
 		t.Fatalf("expected flaky error, got: %v", err)
 	}
 	if !frwc.triggered {

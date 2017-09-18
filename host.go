@@ -170,7 +170,7 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 			// connection. Report any errors
 			err := host.wait()
 			// FYI: If err == nul, at this point it would be safe to re-use the
-			// connection and the reqId
+			// connection and the reqID
 			if err2 := dialer.put(conn); err != nil {
 				err = err2
 			}
@@ -371,6 +371,7 @@ func (d poolableDialerAdapter) put(conn net.Conn) error {
 	return conn.Close()
 }
 
+// NetDialer uses net.Dialer to create a connection.
 type NetDialer struct {
 	Network string
 	Address string
@@ -379,6 +380,7 @@ type NetDialer struct {
 	Dialer *net.Dialer
 }
 
+// Dial creates a connection to Address in Network via Dialer.
 func (d *NetDialer) Dial(ctx context.Context) (net.Conn, error) {
 	dialer := d.Dialer
 	if dialer == nil {
@@ -387,11 +389,11 @@ func (d *NetDialer) Dial(ctx context.Context) (net.Conn, error) {
 	return dialer.DialContext(ctx, d.Network, d.Address)
 }
 
-const reqId = 1
+const reqID = 1
 
-var endedError error = errors.New("response complete; request implicitly closed")
+var errEnded = errors.New("response complete; request implicitly closed")
 
-var recordPool sync.Pool = sync.Pool{
+var recordPool = sync.Pool{
 	New: func() interface{} {
 		return &record{}
 	},
@@ -420,16 +422,16 @@ type host struct {
 // handle issues an http request with cgi-style env headers and req body,
 // returning HTTP-encoded response.
 func (h *host) handle(env map[string]string, req io.ReadCloser) error {
-	if err := h.conn.writeBeginRequest(reqId, roleResponder, flagKeepConn); err != nil {
+	if err := h.conn.writeBeginRequest(reqID, roleResponder, flagKeepConn); err != nil {
 		return err
 	}
 
-	if err := h.conn.writePairs(typeParams, reqId, env); err != nil {
+	if err := h.conn.writePairs(typeParams, reqID, env); err != nil {
 		return err
 	}
 
 	if req == nil {
-		if err := h.conn.writeRecord(typeStdin, reqId, nil); err != nil {
+		if err := h.conn.writeRecord(typeStdin, reqID, nil); err != nil {
 			return err
 		}
 	} else {
@@ -440,11 +442,11 @@ func (h *host) handle(env map[string]string, req io.ReadCloser) error {
 		h.writerDone.Add(1)
 		go func() {
 			defer h.writerDone.Done()
-			body := &streamWriter{c: h.conn, recType: typeStdin, reqId: reqId}
+			body := &streamWriter{c: h.conn, recType: typeStdin, reqId: reqID}
 			// Since ServeHTTP() can't return until this goroutine completes,
 			// try to return promptly if the response completes early.
 			_, err := io.Copy(body, checkEndedReader{req, h})
-			if err == endedError {
+			if err == errEnded {
 				err = nil
 			}
 			if err1 := req.Close(); err == nil {
@@ -456,7 +458,7 @@ func (h *host) handle(env map[string]string, req io.ReadCloser) error {
 				h.writerErr = err
 				h.mu.Unlock()
 				// Squelch returned error; already reporting an error
-				h.conn.writeAbortRequest(reqId)
+				h.conn.writeAbortRequest(reqID)
 				return
 			}
 			err = body.Close()
@@ -501,7 +503,7 @@ func (h *host) handleRecord(rec *record) error {
 		// typeGetValues
 		return fmt.Errorf("fcgi: unexpected management record: %d", rec.h.Type)
 	}
-	if rec.h.Id != reqId {
+	if rec.h.Id != reqID {
 		// Applications must ignore unknown requestIds, but web servers don't
 		return errors.New("fcgi: received frame for unexpected requestId")
 	}
@@ -607,7 +609,7 @@ func (r checkEndedReader) Read(p []byte) (int, error) {
 	r.h.mu.Unlock()
 
 	if stop {
-		return 0, endedError
+		return 0, errEnded
 	}
 	return r.ReadCloser.Read(p)
 }
