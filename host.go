@@ -25,7 +25,7 @@ import (
 
 var trailingPort = regexp.MustCompile(`:([0-9]+)$`)
 
-// Handler runs an executable in a subprocess with a CGI environment.
+// Handler delegates requests to a pre-existing process, using CGI semantics.
 type Handler struct {
 	Dialer Dialer // dialer for each request
 
