@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// Package fcgi implements the FastCGI protocol.
+// Package fcgi implements a net/http/cgi-like FastCGI client
 //
 // The protocol is not an official standard and the original
 // documentation is no longer online. See the Internet Archive's
