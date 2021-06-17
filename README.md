@@ -1,6 +1,5 @@
 # Go FastCGI client
 
-[![Build Status](https://travis-ci.org/ejona86/fcgi.svg?branch=master)](https://travis-ci.org/ejona86/fcgi)
 [![GoDoc](https://godoc.org/github.com/ejona86/fcgi?status.svg)](http://godoc.org/github.com/ejona86/fcgi)
 
 A FastCGI client for web servers to communicate with FastCGI application
