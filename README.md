@@ -1,6 +1,6 @@
 # Go FastCGI client
 
-[![GoDoc](https://godoc.org/github.com/ejona86/fcgi?status.svg)](http://godoc.org/github.com/ejona86/fcgi)
+[![Go Reference](https://pkg.go.dev/badge/github.com/ejona86/fcgi.svg)](https://pkg.go.dev/github.com/ejona86/fcgi)
 
 A FastCGI client for web servers to communicate with FastCGI application
 servers, like those implemented in Go with net/http/fcgi, Python, and PHP.
